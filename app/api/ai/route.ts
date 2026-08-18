@@ -7,6 +7,9 @@ export const dynamic = "force-dynamic";
 
 const INTERNAL_ROLES = new Set(["مدیر سیستم", "پزشک", "پذیرش", "حسابداری", "داروخانه"]);
 const MAX_MESSAGE_LENGTH = 4000;
+const DIGIT = "0-9۰-۹٠-٩";
+const MOBILE_PATTERN = new RegExp(`(?<![${DIGIT}])(?:\\+?98|0)?[\\s-]*9(?:[\\s-]*[${DIGIT}]){9}(?![${DIGIT}])`, "g");
+const NATIONAL_ID_PATTERN = new RegExp(`(?<![${DIGIT}])(?:[${DIGIT}][\\s-]*){9}[${DIGIT}](?![${DIGIT}])`, "g");
 
 function tehranDate() {
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -17,6 +20,18 @@ function tehranDate() {
   }).formatToParts(new Date());
   const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
   return `${values.year}-${values.month}-${values.day}`;
+}
+
+function redactSensitiveIdentifiers(input: string) {
+  let redacted = false;
+  const replace = (label: string) => () => {
+    redacted = true;
+    return label;
+  };
+  const message = input
+    .replace(MOBILE_PATTERN, replace("[شماره تماس حذف شد]"))
+    .replace(NATIONAL_ID_PATTERN, replace("[کد ملی حذف شد]"));
+  return { message, redacted };
 }
 
 async function clinicSnapshot() {
@@ -64,10 +79,11 @@ export async function POST(request: Request) {
     if (!INTERNAL_ROLES.has(user.role)) return Response.json({ error: "دستیار هوش مصنوعی فقط برای کاربران داخلی کلینیک فعال است" }, { status: 403 });
 
     const payload = await request.json() as { message?: unknown };
-    const message = typeof payload.message === "string" ? payload.message.trim() : "";
-    if (!message) return Response.json({ error: "پیام خالی است" }, { status: 400 });
-    if (message.length > MAX_MESSAGE_LENGTH) return Response.json({ error: "پیام بیش از حد طولانی است" }, { status: 400 });
+    const rawMessage = typeof payload.message === "string" ? payload.message.trim() : "";
+    if (!rawMessage) return Response.json({ error: "پیام خالی است" }, { status: 400 });
+    if (rawMessage.length > MAX_MESSAGE_LENGTH) return Response.json({ error: "پیام بیش از حد طولانی است" }, { status: 400 });
 
+    const { message, redacted } = redactSensitiveIdentifiers(rawMessage);
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) return Response.json({ error: "کلید OpenAI هنوز در محیط سرور تنظیم نشده است" }, { status: 503 });
 
@@ -79,7 +95,7 @@ export async function POST(request: Request) {
       "فقط از داده‌های عملیاتی تجمیعی زیر به عنوان واقعیت سامانه استفاده کن و هیچ عددی را حدس نزن:",
       JSON.stringify(snapshot),
       "اطلاعات هویتی بیمار، کد ملی، شماره تماس یا نام بیمار در context خودکار برای تو ارسال نمی‌شود.",
-      "اگر کاربر اطلاعات شناسایی بیمار را در پیام وارد کرد، از تکرار غیرضروری آن در پاسخ خودداری کن.",
+      "کد ملی و شماره تماس احتمالی موجود در پیام کاربر پیش از ارسال به تو در سرور حذف می‌شوند.",
       "برای پرسش‌های بالینی، پاسخ را به عنوان پشتیبان تصمیم‌گیری ارائه کن، عدم قطعیت و نیاز به قضاوت پزشک را مشخص کن و در صورت کمبود داده نتیجه قطعی نساز.",
       "در این نسخه اجازه تغییر مستقیم پرونده، تراکنش یا نوبت را نداری. اگر کاربر درخواست تغییر داد، فقط مراحل پیشنهادی را توضیح بده.",
     ].join("\n");
@@ -106,7 +122,7 @@ export async function POST(request: Request) {
     const text = extractText(result);
     if (!text) return Response.json({ error: "پاسخ قابل نمایش دریافت نشد" }, { status: 502 });
 
-    return Response.json({ text, model: "gpt-5.6", snapshot });
+    return Response.json({ text, model: "gpt-5.6", snapshot, redacted });
   } catch {
     return Response.json({ error: "پردازش درخواست هوش مصنوعی ناموفق بود" }, { status: 500 });
   }
