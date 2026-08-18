@@ -12,9 +12,9 @@ export default function RamIntro() {
     const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     if (sessionStorage.getItem(SEEN_KEY) || reduced) return;
 
-    setVisible(true);
     const previousOverflow = document.documentElement.style.overflow;
     document.documentElement.style.overflow = "hidden";
+    const openFrame = window.requestAnimationFrame(() => setVisible(true));
     const timer = window.setTimeout(() => {
       sessionStorage.setItem(SEEN_KEY, "1");
       setVisible(false);
@@ -22,6 +22,7 @@ export default function RamIntro() {
     }, 5200);
 
     return () => {
+      window.cancelAnimationFrame(openFrame);
       window.clearTimeout(timer);
       document.documentElement.style.overflow = previousOverflow;
     };
