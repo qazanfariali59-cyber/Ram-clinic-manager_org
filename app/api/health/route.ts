@@ -1,7 +1,7 @@
 import { sql } from "drizzle-orm";
 import { getDb } from "../../../db";
 import { userAccounts } from "../../../db/schema";
-import { getClinicEnv } from "../../db/runtime-env";
+import { getClinicEnv } from "../../../db/runtime-env";
 
 export const dynamic = "force-dynamic";
 
