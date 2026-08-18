@@ -1,5 +1,7 @@
 "use client";
 
+import Image from "next/image";
+import Link from "next/link";
 import { FormEvent, useState } from "react";
 
 type ChatMessage = { role: "user" | "assistant"; text: string };
@@ -58,7 +60,7 @@ export default function AiClient({ displayName, role }: { displayName: string; r
       <div className="ram-ai-frame">
         <aside className="ram-ai-side">
           <div className="ram-ai-brand">
-            <img className="ram-ai-logo" src="/ram-brand.jpg" alt="RAM" />
+            <Image className="ram-ai-logo" src="/ram-brand.jpg" alt="RAM" width={48} height={48} priority />
             <div><strong>RAM AI</strong><small>Clinical Operations Intelligence</small></div>
           </div>
           <span className="ram-ai-kicker">دستیار هوشمند مدیریت</span>
@@ -66,7 +68,7 @@ export default function AiClient({ displayName, role }: { displayName: string; r
           <p>نسخه نخست روی تحلیل، برنامه‌ریزی و پیشنهاد مدیریتی متمرکز است و هنوز بدون تأیید شما هیچ تغییری در پرونده‌ها یا امور مالی انجام نمی‌دهد.</p>
           <div className="ram-ai-user"><strong>{displayName}</strong><small>{role}</small></div>
           <div className="ram-ai-privacy">برای حفظ محرمانگی، در گفت‌وگو کد ملی، شماره تماس یا سایر شناسه‌های مستقیم بیمار را وارد نکنید.</div>
-          <a className="ram-ai-back" href="/">← بازگشت به سامانه اصلی</a>
+          <Link className="ram-ai-back" href="/">← بازگشت به سامانه اصلی</Link>
         </aside>
 
         <section className="ram-ai-chat">
