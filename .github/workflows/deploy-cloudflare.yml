@@ -1,59 +1,315 @@
-name: Deploy RAM to Cloudflare
+name: Deploy RAM canary to Cloudflare
+run-name: RAM Cloudflare canary — ${{ inputs.action }} by @${{ github.actor }}
 
 on:
   workflow_dispatch:
+    inputs:
+      action:
+        description: Choose a read-only preflight before the first canary deployment
+        required: true
+        default: preflight
+        type: choice
+        options:
+          - preflight
+          - deploy-canary
+      confirmation:
+        description: For deploy-canary only, type DEPLOY_RAM_CANARY
+        required: false
+        default: ""
+        type: string
+      allow_existing_canary:
+        description: Allow updating an existing canary Worker (leave off for the first deployment)
+        required: true
+        default: false
+        type: boolean
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
-  group: ram-cloudflare-production
+  group: ram-cloudflare-canary
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  canary:
+    name: Validate and deploy isolated canary
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: cloudflare-canary
     env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      CANARY_WORKER_NAME: ram-clinic-manager-canary
+      CANARY_DATABASE_NAME: ram-clinic-manager-canary-db
+      REQUESTED_ACTION: ${{ inputs.action }}
+      DEPLOY_CONFIRMATION: ${{ inputs.confirmation }}
+      ALLOW_EXISTING_CANARY: ${{ inputs.allow_existing_canary }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_CANARY_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_CANARY_ACCOUNT_ID }}
+      CLOUDFLARE_CANARY_D1_DATABASE_ID: ${{ secrets.CLOUDFLARE_CANARY_D1_DATABASE_ID }}
 
     steps:
+      - name: Guard the requested operation
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/main" ]] || {
+            echo "Canary operations must run from main; received $GITHUB_REF." >&2
+            exit 1
+          }
+          [[ "$REQUESTED_ACTION" == "preflight" || "$REQUESTED_ACTION" == "deploy-canary" ]] || {
+            echo "Unsupported action: $REQUESTED_ACTION" >&2
+            exit 1
+          }
+          if [[ "$REQUESTED_ACTION" == "deploy-canary" && "$DEPLOY_CONFIRMATION" != "DEPLOY_RAM_CANARY" ]]; then
+            echo "Deployment requires the exact confirmation DEPLOY_RAM_CANARY." >&2
+            exit 1
+          fi
+
+      - name: Verify the GitHub Environment approval gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          environment_info="$RUNNER_TEMP/cloudflare-canary-environment.json"
+          curl --fail-with-body --silent --show-error \
+            --output "$environment_info" \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "X-GitHub-Api-Version: 2026-03-10" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/environments/cloudflare-canary"
+
+          jq -e '
+            .name == "cloudflare-canary" and
+            any(.protection_rules[]?;
+              .type == "required_reviewers" and (.reviewers | length) > 0
+            )
+          ' "$environment_info" > /dev/null || {
+            echo "The cloudflare-canary Environment must have at least one required reviewer." >&2
+            exit 1
+          }
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Use Node.js 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
 
-      - name: Verify Cloudflare credentials are configured
+      - name: Verify canary credentials and identifiers
         shell: bash
         run: |
-          test -n "$CLOUDFLARE_API_TOKEN" || { echo "Missing CLOUDFLARE_API_TOKEN" >&2; exit 1; }
-          test -n "$CLOUDFLARE_ACCOUNT_ID" || { echo "Missing CLOUDFLARE_ACCOUNT_ID" >&2; exit 1; }
+          set -euo pipefail
+          [[ -n "$CLOUDFLARE_API_TOKEN" ]] || {
+            echo "Missing CLOUDFLARE_CANARY_API_TOKEN in the cloudflare-canary environment." >&2
+            exit 1
+          }
+          [[ "$CLOUDFLARE_ACCOUNT_ID" =~ ^[0-9a-fA-F]{32}$ ]] || {
+            echo "CLOUDFLARE_CANARY_ACCOUNT_ID must be a 32-character Cloudflare account ID." >&2
+            exit 1
+          }
+          [[ "$CLOUDFLARE_CANARY_D1_DATABASE_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || {
+            echo "CLOUDFLARE_CANARY_D1_DATABASE_ID must be a D1 UUID." >&2
+            exit 1
+          }
 
-      - name: Install dependencies
+      - name: Install locked dependencies
         run: npm ci
+
+      - name: Render the ephemeral canary configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          rendered="$RUNNER_TEMP/wrangler.canary.jsonc"
+          jq --arg database_id "$CLOUDFLARE_CANARY_D1_DATABASE_ID" \
+            '.d1_databases[0].database_id = $database_id' \
+            cloudflare/wrangler.canary.template.json > "$rendered"
+
+          jq -e \
+            --arg worker "$CANARY_WORKER_NAME" \
+            --arg database "$CANARY_DATABASE_NAME" \
+            --arg database_id "$CLOUDFLARE_CANARY_D1_DATABASE_ID" \
+            '
+              .name == $worker and
+              .workers_dev == false and
+              .preview_urls == false and
+              .route == null and
+              ((.routes // []) | length == 0) and
+              ([.d1_databases[] |
+                select(
+                  .binding == "DB" and
+                  .database_name == $database and
+                  .database_id == $database_id and
+                  .migrations_dir == "drizzle"
+                )
+              ] | length == 1)
+            ' "$rendered" > /dev/null
+
+          cp "$rendered" wrangler.jsonc
+          echo "Rendered an ephemeral canary config; the repository production config was not changed."
 
       - name: Lint
         run: npm run lint
 
-      - name: Deploy Worker and auto-provision D1
-        run: npx vinext deploy --name ram-clinic-manager
+      - name: Build and validate the Worker locally
+        run: npm run build
 
-      - name: Apply D1 migrations
-        run: npx wrangler d1 migrations apply DB --remote --config wrangler.jsonc
-
-      - name: Configure RAM AI secret when available
+      - name: Verify the generated deploy target and run a local dry-run
         shell: bash
         run: |
-          if [ -n "$OPENAI_API_KEY" ]; then
-            printf '%s' "$OPENAI_API_KEY" | npx wrangler secret put OPENAI_API_KEY --name ram-clinic-manager
-          else
-            echo "OPENAI_API_KEY is not configured; core clinic app remains deployable and RAM AI will stay disabled."
-          fi
+          set -euo pipefail
+          redirect=".wrangler/deploy/config.json"
+          [[ -f "$redirect" ]] || {
+            echo "The Cloudflare Vite build did not emit $redirect." >&2
+            exit 1
+          }
 
-      - name: Show deployment status
-        run: npx wrangler deployments list --name ram-clinic-manager
+          deploy_config="$(node --input-type=module - "$redirect" <<'NODE'
+          import { readFile } from "node:fs/promises";
+          import { dirname, resolve } from "node:path";
+
+          const redirectPath = process.argv[2];
+          const redirect = JSON.parse(await readFile(redirectPath, "utf8"));
+          if (!redirect.configPath || typeof redirect.configPath !== "string") {
+            throw new Error("Generated Wrangler redirect is missing configPath");
+          }
+          console.log(resolve(dirname(redirectPath), redirect.configPath));
+          NODE
+          )"
+          [[ -f "$deploy_config" ]] || {
+            echo "Generated deploy config does not exist: $deploy_config" >&2
+            exit 1
+          }
+
+          jq -e \
+            --arg worker "$CANARY_WORKER_NAME" \
+            --arg database "$CANARY_DATABASE_NAME" \
+            --arg database_id "$CLOUDFLARE_CANARY_D1_DATABASE_ID" \
+            '
+              .name == $worker and
+              .workers_dev == false and
+              .preview_urls == false and
+              .route == null and
+              ((.routes // []) | length == 0) and
+              ([.d1_databases[] |
+                select(
+                  .binding == "DB" and
+                  .database_name == $database and
+                  .database_id == $database_id
+                )
+              ] | length == 1)
+            ' "$deploy_config" > /dev/null
+
+          npx wrangler deploy --dry-run --strict
+
+      - name: Verify the remote D1 target by name and ID
+        shell: bash
+        run: |
+          set -euo pipefail
+          d1_info="$RUNNER_TEMP/canary-d1-info.json"
+          curl --fail-with-body --silent --show-error \
+            --output "$d1_info" \
+            --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database/$CLOUDFLARE_CANARY_D1_DATABASE_ID"
+
+          jq -e \
+            --arg database "$CANARY_DATABASE_NAME" \
+            --arg database_id "$CLOUDFLARE_CANARY_D1_DATABASE_ID" \
+            '.success == true and .result.name == $database and .result.uuid == $database_id' \
+            "$d1_info" > /dev/null
+
+          npx wrangler d1 migrations list "$CANARY_DATABASE_NAME" \
+            --remote \
+            --config wrangler.jsonc
+
+      - name: Verify first-deployment Worker state
+        shell: bash
+        run: |
+          set -euo pipefail
+          response="$RUNNER_TEMP/canary-worker-state.json"
+          status="$(curl --silent --show-error \
+            --output "$response" \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$CANARY_WORKER_NAME/subdomain")"
+
+          case "$status" in
+            200)
+              jq -e '.success == true' "$response" > /dev/null
+              if [[ "$ALLOW_EXISTING_CANARY" != "true" ]]; then
+                echo "The canary Worker already exists. Leave the first-deployment guard enabled and inspect it before allowing an update." >&2
+                exit 1
+              fi
+              echo "Existing canary Worker acknowledged."
+              ;;
+            404)
+              echo "No existing canary Worker was found; first-deployment guard passed."
+              ;;
+            *)
+              echo "Cloudflare Worker lookup failed with HTTP $status." >&2
+              jq -r '.errors[]?.message // empty' "$response" >&2 || true
+              exit 1
+              ;;
+          esac
+
+      - name: Record successful preflight
+        shell: bash
+        run: |
+          {
+            echo "## Cloudflare canary preflight"
+            echo
+            echo "- Action: $REQUESTED_ACTION"
+            echo "- Worker: $CANARY_WORKER_NAME"
+            echo "- D1: $CANARY_DATABASE_NAME (name and ID verified)"
+            echo "- Public workers.dev route: disabled by reviewed config"
+            echo "- Preview URLs: disabled by reviewed config"
+            if [[ "$REQUESTED_ACTION" == "preflight" ]]; then
+              echo "- Result: read-only preflight completed; no Cloudflare resource was changed"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Apply migrations to the isolated canary D1
+        if: ${{ inputs.action == 'deploy-canary' }}
+        run: >-
+          npx wrangler d1 migrations apply "$CANARY_DATABASE_NAME"
+          --remote
+          --config wrangler.jsonc
+
+      - name: Deploy the unreachable canary Worker
+        if: ${{ inputs.action == 'deploy-canary' }}
+        run: >-
+          npx wrangler deploy
+          --strict
+          --message "RAM isolated canary from GitHub $GITHUB_SHA"
+
+      - name: Verify migrations and public routes after deployment
+        if: ${{ inputs.action == 'deploy-canary' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx wrangler d1 migrations list "$CANARY_DATABASE_NAME" \
+            --remote \
+            --config wrangler.jsonc
+
+          subdomain="$RUNNER_TEMP/canary-subdomain.json"
+          curl --fail-with-body --silent --show-error \
+            --output "$subdomain" \
+            --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$CANARY_WORKER_NAME/subdomain"
+
+          jq -e \
+            '.success == true and .result.enabled == false and .result.previews_enabled == false' \
+            "$subdomain" > /dev/null
+
+          npx wrangler deployments list \
+            --name "$CANARY_WORKER_NAME" \
+            --config wrangler.jsonc
+
+          {
+            echo "- Deployment: completed on isolated canary resources"
+            echo "- Exposure check: workers.dev and preview URLs are both disabled"
+            echo "- OPENAI_API_KEY: intentionally not configured for the first canary"
+          } >> "$GITHUB_STEP_SUMMARY"
