@@ -50,62 +50,6 @@ jobs:
       - name: Apply D1 migrations
         run: npx wrangler d1 migrations apply DB --remote --config wrangler.jsonc
 
-      - name: Ensure workers.dev subdomain is registered
-        shell: bash
-        run: |
-          set -euo pipefail
-          api_url="https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/subdomain"
-          response_file="$RUNNER_TEMP/workers-dev-subdomain.json"
-          http_status="$(curl --silent --show-error \
-            --output "$response_file" \
-            --write-out '%{http_code}' \
-            --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-            --header "Content-Type: application/json" \
-            "$api_url")"
-
-          case "$http_status" in
-            200)
-              if ! jq -e '.success == true' "$response_file" > /dev/null; then
-                jq -r '.errors[]? | "\(.code): \(.message)"' "$response_file" >&2
-                exit 1
-              fi
-              subdomain="$(jq -r '.result.subdomain // empty' "$response_file")"
-              ;;
-            404)
-              subdomain=""
-              ;;
-            *)
-              echo "Cloudflare subdomain lookup failed with HTTP $http_status." >&2
-              jq -r '.errors[]? | "\(.code): \(.message)"' "$response_file" >&2 || true
-              exit 1
-              ;;
-          esac
-
-          if [ -z "$subdomain" ]; then
-            preferred_subdomain="ramclinic-${CLOUDFLARE_ACCOUNT_ID:0:12}"
-            request_body="$(jq -nc --arg subdomain "$preferred_subdomain" '{subdomain: $subdomain}')"
-            http_status="$(curl --silent --show-error \
-              --request PUT \
-              --output "$response_file" \
-              --write-out '%{http_code}' \
-              --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-              --header "Content-Type: application/json" \
-              --data "$request_body" \
-              "$api_url")"
-
-            if [ "$http_status" != "200" ] || ! jq -e '.success == true' "$response_file" > /dev/null; then
-              echo "Cloudflare workers.dev registration failed with HTTP $http_status." >&2
-              jq -r '.errors[]? | "\(.code): \(.message)"' "$response_file" >&2 || true
-              exit 1
-            fi
-            subdomain="$preferred_subdomain"
-          fi
-
-          worker_url="https://ram-clinic-manager.${subdomain}.workers.dev"
-          echo "WORKERS_DEV_SUBDOMAIN=$subdomain" >> "$GITHUB_ENV"
-          echo "WORKER_URL=$worker_url" >> "$GITHUB_ENV"
-          echo "workers.dev subdomain ready: $subdomain"
-
       - name: Deploy Worker
         run: npx vinext deploy --name ram-clinic-manager
 
@@ -118,35 +62,33 @@ jobs:
             echo "OPENAI_API_KEY is not configured; core clinic app remains deployable and RAM AI will stay disabled."
           fi
 
-      - name: Verify live deployment
+      - name: Verify public Worker routes are disabled
         shell: bash
         run: |
           set -euo pipefail
-          health_file="$RUNNER_TEMP/ram-health.json"
-          for attempt in $(seq 1 12); do
-            http_status="$(curl --silent --show-error --location --max-time 20 \
-              --output "$health_file" \
-              --write-out '%{http_code}' \
-              "$WORKER_URL/api/health" || true)"
-            if [ "$http_status" = "200" ] && jq -e \
-              '.ok == true and .storage.ok == true and .storage.mode == "d1-binding"' \
-              "$health_file" > /dev/null; then
-              echo "RAM is healthy at $WORKER_URL"
-              {
-                echo "## RAM Cloudflare deployment"
-                echo
-                echo "- URL: [$WORKER_URL]($WORKER_URL)"
-                echo "- D1: connected and migrated"
-                echo "- Health check: passed"
-              } >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            sleep 5
-          done
+          response_file="$RUNNER_TEMP/ram-worker-route.json"
+          http_status="$(curl --silent --show-error \
+            --output "$response_file" \
+            --write-out '%{http_code}' \
+            --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/workers/scripts/ram-clinic-manager/subdomain")"
 
-          echo "RAM health check failed at $WORKER_URL (last HTTP status: $http_status)." >&2
-          jq '{ok, storage, ai, error}' "$health_file" >&2 || true
-          exit 1
+          if [ "$http_status" != "200" ] || ! jq -e \
+            '.success == true and .result.enabled == false and .result.previews_enabled == false' \
+            "$response_file" > /dev/null; then
+            echo "The RAM Worker still has a public workers.dev or preview route." >&2
+            jq '{success, result, errors}' "$response_file" >&2 || true
+            exit 1
+          fi
+
+          {
+            echo "## RAM Cloudflare deployment"
+            echo
+            echo "- Worker: deployed"
+            echo "- D1: connected and migrated"
+            echo "- Public workers.dev route: disabled until Cloudflare Access is configured"
+            echo "- Preview URLs: disabled"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Show deployment status
         run: npx wrangler deployments list --name ram-clinic-manager
