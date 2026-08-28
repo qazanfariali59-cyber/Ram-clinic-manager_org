@@ -124,7 +124,7 @@ export const collaboratorServiceShares = sqliteTable("collaborator_service_share
 
 export const userAccounts = sqliteTable("user_accounts", {
   id: text("id").primaryKey(), email: text("email").notNull().unique(), displayName: text("display_name").notNull(),
-  role: text("role").notNull().default("پذیرش"), colleagueName: text("colleague_name"),
+  role: text("role").notNull().default("پذیرش"), colleagueName: text("colleague_name"), patientId: text("patient_id"),
   status: text("status").notNull().default("active"), createdAt,
 });
 

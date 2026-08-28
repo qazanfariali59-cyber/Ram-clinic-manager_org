@@ -5,9 +5,6 @@ export const metadata: Metadata = {
   title: "سامانه مدیریت کلینیک چندتخصصی درد رام",
   description:
     "مدیریت یکپارچه بیماران، پرسنل، همکاران ارجاع‌دهنده، CRM و داروخانه کلینیک رام",
-  other: {
-    "codex-preview": "development",
-  },
 };
 
 export default function RootLayout({

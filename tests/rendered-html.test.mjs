@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-test("redirects anonymous visitors to secure sign-in", async () => {
+test("renders a secure explicit sign-in page for anonymous visitors", async () => {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
   const { default: worker } = await import(workerUrl.href);
@@ -21,6 +21,9 @@ test("redirects anonymous visitors to secure sign-in", async () => {
     },
   );
 
-  assert.equal(response.status, 307);
-  assert.match(response.headers.get("location") ?? "", /\/signin-with-chatgpt\?return_to=/);
+  assert.equal(response.status, 200);
+  const html = await response.text();
+  assert.match(html, /ورود به سامانه/);
+  assert.match(html, /href="\/signin-with-chatgpt\?return_to=%2F"/);
+  assert.match(html, /target="_top"/);
 });
