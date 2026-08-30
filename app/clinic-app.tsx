@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import AccessView, { type UserAccountRecord } from "./access-view";
 import ServicesView, { type MedicalServiceRecord, type ServiceShareRecord, type TariffSettingsRecord } from "./services-view";
 
 type NavKey =
@@ -13,6 +14,7 @@ type NavKey =
   | "pharmacy"
   | "finance"
   | "services"
+  | "users"
   | "reports";
 
 type IconName =
@@ -74,6 +76,7 @@ const navItems: { key: NavKey; label: string; icon: IconName; badge?: string }[]
   { key: "pharmacy", label: "داروخانه", icon: "pill" },
   { key: "finance", label: "مالی و تسویه", icon: "wallet" },
   { key: "services", label: "خدمات و تعرفه‌ها", icon: "services" },
+  { key: "users", label: "کاربران و دسترسی", icon: "users" },
   { key: "reports", label: "گزارش‌ها", icon: "chart" },
 ];
 
@@ -88,6 +91,7 @@ type Patient = {
   service: string;
   doctor: string;
   lastVisit: string;
+  createdAt: string;
   status: string;
   balance: number;
   tags: string[];
@@ -176,13 +180,22 @@ type VisitRecord = {
   treatment: string | null; medications: string | null; followUpAt: string | null; createdAt: string;
 };
 
+type PatientTimelineItem = {
+  id: string;
+  kind: "visit" | "appointment" | "payment" | "profile";
+  title: string;
+  detail: string;
+  meta: string;
+  at: string;
+};
+
 const permissions: Record<string, NavKey[]> = {
   "مدیر سیستم": navItems.map((item) => item.key),
   "پذیرش": ["dashboard", "patients", "appointments", "crm", "referrals", "services"],
   "پزشک": ["dashboard", "patients", "appointments", "services", "reports"],
   "حسابداری": ["dashboard", "personnel", "referrals", "finance", "services", "reports"],
   "داروخانه": ["dashboard", "pharmacy", "finance", "reports"],
-  "همکار بیرونی": ["dashboard", "referrals", "finance", "services"],
+  "همکار بیرونی": ["dashboard", "referrals", "services"],
 };
 
 function fa(value: number) {
@@ -290,6 +303,9 @@ function WorkspaceView({
   services,
   serviceShares,
   tariffSettings,
+  users,
+  currentEmail,
+  currentColleagueName,
   reloadData,
   showToast,
 }: {
@@ -307,6 +323,9 @@ function WorkspaceView({
   services: MedicalServiceRecord[];
   serviceShares: ServiceShareRecord[];
   tariffSettings: TariffSettingsRecord | null;
+  users: UserAccountRecord[];
+  currentEmail: string;
+  currentColleagueName: string | null;
   reloadData: () => Promise<void>;
   showToast: (message: string) => void;
 }) {
@@ -325,7 +344,16 @@ function WorkspaceView({
   const filteredStaff = staff.filter((member) => (filter === "همه" || member.personnelType === filter) && (!normalized || `${member.name} ${member.role} ${member.specialty}`.toLowerCase().includes(normalized)));
   const filteredMedications = medications.filter((item) => !normalized || `${item.name} ${item.genericName} ${item.category}`.toLowerCase().includes(normalized));
   const activeServices = services.filter((item) => item.active);
-  const selectedPatientVisits = selectedPatient ? visits.filter((item)=>item.patientId===selectedPatient.id) : [];
+  const selectedPatientTimeline = useMemo(() => {
+    if (!selectedPatient) return [];
+    const events: PatientTimelineItem[] = [
+      { id: `profile-${selectedPatient.id}`, kind: "profile", title: "ایجاد پرونده الکترونیک", detail: selectedPatient.service || "ثبت اطلاعات پایه بیمار", meta: selectedPatient.doctor || "کلینیک رام", at: selectedPatient.createdAt },
+      ...visits.filter((item) => item.patientId === selectedPatient.id).map((item): PatientTimelineItem => ({ id: item.id, kind: "visit", title: item.diagnosis || item.chiefComplaint || "یادداشت درمانی", detail: item.treatment || item.medications || "جزئیات بالینی ثبت شد", meta: item.doctor, at: item.createdAt })),
+      ...appointmentRecords.filter((item) => item.patientId === selectedPatient.id).map((item): PatientTimelineItem => ({ id: item.id, kind: "appointment", title: item.service, detail: item.notes || `وضعیت: ${item.status}`, meta: `${item.doctor} · ${item.time}`, at: `${item.date}T${item.time || "00:00"}:00` })),
+      ...transactions.filter((item) => item.patientId === selectedPatient.id).map((item): PatientTimelineItem => ({ id: item.id, kind: "payment", title: item.description, detail: `${toman(item.amount)} تومان · ${item.status === "paid" ? "پرداخت‌شده" : "باز"}`, meta: "گردش مالی پرونده", at: item.createdAt })),
+    ];
+    return events.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime());
+  }, [appointmentRecords, selectedPatient, transactions, visits]);
   const completedAppointments = appointmentRecords.filter((item)=>item.status==="completed").length;
   const reportIncome = transactions.filter((item)=>item.category!=="expense"&&item.status==="paid").reduce((sum,item)=>sum+item.amount,0);
   const serviceMap = appointmentRecords.reduce<Record<string,number>>((acc,item)=>{acc[item.service]=(acc[item.service]||0)+1;return acc;},{});
@@ -421,7 +449,7 @@ function WorkspaceView({
         </>}
         {modal === "referral" && <>
           <label className="full important-field"><span>کد ملی بیمار</span><input name="nationalId" required inputMode="numeric" pattern="[0-9]{10}" maxLength={10} placeholder="۱۰ رقم بدون خط تیره" dir="ltr" autoFocus /></label>
-          <label className="full"><span>همکار ارجاع‌دهنده</span><select name="colleagueName">{staff.filter((member)=>member.personnelType==="بیرونی").map((member)=><option key={member.id}>{member.name}</option>)}</select></label>
+          {role === "همکار بیرونی" ? <><input type="hidden" name="colleagueName" value={currentColleagueName ?? ""}/><div className="form-note full"><Icon name="share" size={17}/><span>ارجاع به نام {currentColleagueName || "حساب همکار متصل"} ثبت می‌شود.</span></div></> : <label className="full"><span>همکار ارجاع‌دهنده</span><select name="colleagueName">{staff.filter((member)=>member.personnelType==="بیرونی").map((member)=><option key={member.id}>{member.name}</option>)}</select></label>}
           <label className="full"><span>خدمت پیشنهادی (اختیاری)</span><select name="serviceId"><option value="">بعداً توسط پذیرش تعیین شود</option>{activeServices.map((item)=><option key={item.id} value={item.id}>{item.nationalCode} · {item.title}</option>)}</select></label>
           <div className="form-note full"><Icon name="check" size={17}/><span>پس از ثبت، پذیرش کلینیک پرونده را تکمیل می‌کند و وضعیت ارجاع برای همکار قابل مشاهده خواهد بود.</span></div>
         </>}
@@ -456,6 +484,10 @@ function WorkspaceView({
     return <ServicesView role={role} services={services} shares={serviceShares} settings={tariffSettings} staff={staff} consumables={medications} reloadData={reloadData} showToast={showToast} />;
   }
 
+  if (active === "users") {
+    return <AccessView users={users} staff={staff} patients={patients} currentEmail={currentEmail} reloadData={reloadData} showToast={showToast} />;
+  }
+
   if (active === "patients") {
     return (
       <>
@@ -478,7 +510,7 @@ function WorkspaceView({
           </div>
           <div className="table-footer"><span>نمایش {fa(filteredPatients.length)} پرونده از {fa(patients.length)} بیمار</span></div>
         </section>
-        {selectedPatient && <div className="drawer-backdrop" onMouseDown={()=>setSelectedPatient(null)}><aside className="patient-drawer" onMouseDown={(event)=>event.stopPropagation()}><header><button onClick={()=>setSelectedPatient(null)}>×</button><span className="patient-avatar cyan">{selectedPatient.name.slice(0,2)}</span><div><small>پرونده {selectedPatient.id}</small><h2>{selectedPatient.name}</h2><p>{selectedPatient.phone} · {selectedPatient.age} سال</p></div></header><div className="drawer-tags">{selectedPatient.tags.map((tag)=><span key={tag}>{tag}</span>)}</div><section className="patient-summary"><div><small>کد ملی</small><strong className="mono">{selectedPatient.nationalId}</strong></div><div><small>پزشک مسئول</small><strong>{selectedPatient.doctor}</strong></div><div><small>وضعیت پرونده</small><strong>{selectedPatient.status}</strong></div><div><small>مانده حساب</small><strong className={selectedPatient.balance?"amount-due":"amount-ok"}>{selectedPatient.balance?`${toman(selectedPatient.balance)} تومان`:"تسویه"}</strong></div></section><section className="drawer-history"><h3>سوابق درمانی ثبت‌شده</h3>{selectedPatientVisits.length?selectedPatientVisits.map((visit)=><div key={visit.id}><i/><span><strong>{visit.diagnosis||visit.chiefComplaint||"یادداشت درمانی"}</strong><small>{visit.doctor} · {new Date(visit.createdAt).toLocaleDateString("fa-IR")}</small>{visit.treatment&&<small>{visit.treatment}</small>}</span></div>):<div><i className="muted"/><span><strong>هنوز یادداشت درمانی ثبت نشده است</strong><small>با دکمه زیر اولین یادداشت را اضافه کنید.</small></span></div>}</section><footer><button className="secondary-button" onClick={()=>showToast("صورتحساب بیمار باز شد")}>صورتحساب</button><button className="primary-button" onClick={()=>setModal("visit")}>ثبت یادداشت درمانی</button></footer></aside></div>}
+        {selectedPatient && <div className="drawer-backdrop" onMouseDown={()=>setSelectedPatient(null)}><aside className="patient-drawer" onMouseDown={(event)=>event.stopPropagation()}><header><button onClick={()=>setSelectedPatient(null)}>×</button><span className="patient-avatar cyan">{selectedPatient.name.slice(0,2)}</span><div><small>پرونده {selectedPatient.id}</small><h2>{selectedPatient.name}</h2><p>{selectedPatient.phone} · {selectedPatient.age} سال</p></div></header><div className="drawer-tags">{selectedPatient.tags.map((tag)=><span key={tag}>{tag}</span>)}</div><section className="patient-summary"><div><small>کد ملی</small><strong className="mono">{selectedPatient.nationalId}</strong></div><div><small>پزشک مسئول</small><strong>{selectedPatient.doctor}</strong></div><div><small>وضعیت پرونده</small><strong>{selectedPatient.status}</strong></div><div><small>مانده حساب</small><strong className={selectedPatient.balance?"amount-due":"amount-ok"}>{selectedPatient.balance?`${toman(selectedPatient.balance)} تومان`:"تسویه"}</strong></div></section><section className="drawer-history patient-timeline"><h3>تایملاین پرونده بیمار</h3>{selectedPatientTimeline.length?selectedPatientTimeline.map((event)=><div key={`${event.kind}-${event.id}`} className={`timeline-${event.kind}`}><i/><span><em>{event.kind === "visit" ? "درمان" : event.kind === "appointment" ? "نوبت" : event.kind === "payment" ? "مالی" : "پرونده"}</em><strong>{event.title}</strong><small>{event.meta} · {new Date(event.at).toLocaleDateString("fa-IR")}</small>{event.detail&&<small>{event.detail}</small>}</span></div>):<div><i className="muted"/><span><strong>هنوز رویدادی ثبت نشده است</strong><small>نوبت، ویزیت و پرداخت‌ها خودکار در این تایملاین قرار می‌گیرند.</small></span></div>}</section><footer><button className="secondary-button" onClick={()=>showToast("صورتحساب بیمار باز شد")}>صورتحساب</button>{["مدیر سیستم","پزشک"].includes(role)&&<button className="primary-button" onClick={()=>setModal("visit")}>ثبت یادداشت درمانی</button>}</footer></aside></div>}
         {modalLayer}
       </>
     );
@@ -593,7 +625,7 @@ function WorkspaceView({
   );
 }
 
-export default function ClinicApp({ user }: { user: { displayName: string; email: string; role: string; colleagueName: string | null } }) {
+export default function ClinicApp({ user }: { user: { displayName: string; email: string; role: string; colleagueName: string | null; patientId: string | null } }) {
   const [active, setActive] = useState<NavKey>("dashboard");
   const role = roles.includes(user.role) ? user.role : "پذیرش";
   const [searchOpen, setSearchOpen] = useState(false);
@@ -610,7 +642,9 @@ export default function ClinicApp({ user }: { user: { displayName: string; email
   const [services, setServices] = useState<MedicalServiceRecord[]>([]);
   const [serviceShares, setServiceShares] = useState<ServiceShareRecord[]>([]);
   const [tariffSettings, setTariffSettings] = useState<TariffSettingsRecord | null>(null);
+  const [users, setUsers] = useState<UserAccountRecord[]>([]);
   const [loading, setLoading] = useState(true);
+  const [seedingDemo, setSeedingDemo] = useState(false);
   const [dataError, setDataError] = useState("");
 
   const visibleNavItems = useMemo(() => navItems.filter((item) => permissions[role].includes(item.key)), [role]);
@@ -621,7 +655,7 @@ export default function ClinicApp({ user }: { user: { displayName: string; email
     const payload = await response.json() as Record<string, unknown> & { error?: string };
     if (!response.ok) { setDataError(payload.error || "دریافت اطلاعات ناموفق بود"); setLoading(false); return; }
     const patientRows = (payload.patients ?? []) as Array<Record<string, unknown>>;
-    setPatients(patientRows.map((row): Patient => ({ id:String(row.id), nationalId:String(row.nationalId), name:String(row.name), phone:String(row.phone), age:"—", service:String(row.service??"—"), doctor:String(row.doctor??"تخصیص داده نشده"), lastVisit:new Date(String(row.createdAt)).toLocaleDateString("fa-IR"), status:row.status==="active"?"فعال":String(row.status), balance:Number(row.balance??0), tags:(()=>{try{return JSON.parse(String(row.tags??"[]")) as string[]}catch{return []}})() })));
+    setPatients(patientRows.map((row): Patient => { const createdAt=String(row.createdAt); const status=String(row.status); return { id:String(row.id), nationalId:String(row.nationalId), name:String(row.name), phone:String(row.phone), age:"—", service:String(row.service??"—"), doctor:String(row.doctor??"تخصیص داده نشده"), lastVisit:new Date(createdAt).toLocaleDateString("fa-IR"), createdAt, status:status==="active"?"فعال":status==="treatment"?"در حال درمان":status==="waiting"?"در انتظار":status, balance:Number(row.balance??0), tags:(()=>{try{return JSON.parse(String(row.tags??"[]")) as string[]}catch{return []}})() }; }));
     const staffRows = (payload.staff ?? []) as Array<Record<string, unknown>>;
     setStaff(staffRows.map((row): StaffMember => ({ id:String(row.id), name:String(row.name), initials:String(row.name).slice(0,2), personnelType:String(row.personnelType)==="بیرونی"?"بیرونی":"داخلی", role:String(row.role), specialty:String(row.specialty??"—"), phone:String(row.phone??"—"), shift:String(row.shift??"تعیین نشده"), status:row.status==="active"?"فعال":String(row.status), revenueShare:Number(row.revenueShare??0), tone:"cyan" })));
     const leadRows = (payload.leads ?? []) as Array<Record<string, unknown>>;
@@ -637,6 +671,7 @@ export default function ClinicApp({ user }: { user: { displayName: string; email
     setServices((payload.services ?? []) as MedicalServiceRecord[]);
     setServiceShares((payload.serviceShares ?? []) as ServiceShareRecord[]);
     setTariffSettings((payload.tariffSettings ?? null) as TariffSettingsRecord | null);
+    setUsers((payload.users ?? []) as UserAccountRecord[]);
     const referralRows = (payload.referrals ?? []) as Array<Record<string, unknown>>;
     const grouped = new Map<string,Referral>();
     referralRows.forEach((row)=>{ const name=String(row.colleagueName); const current=grouped.get(name)??{id:name,colleague:name,specialty:String(row.service??"شبکه همکاری"),referrals:0,converted:0,amount:0,due:0,lastReferral:String(row.createdAt??"—"),tone:"cyan"}; current.referrals+=1; if(["treated","completed"].includes(String(row.status))) current.converted+=1; current.amount+=Math.round(Number(row.tariffAmount??0)/10); current.due+=Math.round(Number(row.shareAmount??0)/10); grouped.set(name,current); });
@@ -652,6 +687,19 @@ export default function ClinicApp({ user }: { user: { displayName: string; email
   function showToast(message: string) {
     setToast(message);
     window.setTimeout(() => setToast(""), 2600);
+  }
+
+  async function seedDemoData() {
+    setSeedingDemo(true);
+    try {
+      await persist("demoSeed", {});
+      await reloadData();
+      showToast("داده‌های ساختگی آماده‌اند؛ همه بخش‌ها قابل تعامل هستند");
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : "ساخت داده نمونه ناموفق بود");
+    } finally {
+      setSeedingDemo(false);
+    }
   }
 
   const todayIso = new Date().toISOString().slice(0, 10);
@@ -738,7 +786,10 @@ export default function ClinicApp({ user }: { user: { displayName: string; email
                   <h1>سلام، وقت بخیر <span>{user.displayName.split(" ")[0]}</span></h1>
                   <p>{formatToday()} · یک روز پربازده دیگر در کلینیک رام</p>
                 </div>
-                <button className="primary-button" onClick={() => { setActive("patients"); showToast("فرم پذیرش بیمار باز شد"); }}><Icon name="plus" size={19} /> پذیرش بیمار جدید</button>
+                <div className="welcome-actions">
+                  {role === "مدیر سیستم" && <button className="secondary-button demo-seed-button" disabled={seedingDemo} onClick={() => void seedDemoData()}>{seedingDemo ? "در حال آماده‌سازی..." : "داده نمونه تعاملی"}</button>}
+                  <button className="primary-button" onClick={() => { setActive("patients"); showToast("فرم پذیرش بیمار باز شد"); }}><Icon name="plus" size={19} /> پذیرش بیمار جدید</button>
+                </div>
               </section>
 
               <section className="stats-grid" aria-label="آمار امروز">
@@ -828,7 +879,7 @@ export default function ClinicApp({ user }: { user: { displayName: string; email
                 </article>
               </section>
             </>
-          ) : <WorkspaceView active={active} role={role} patients={patients} staff={staff} leads={leads} setLeads={setLeads} medications={medications} referrals={referrals} appointmentRecords={appointmentRecords} transactions={transactions} visits={visits} services={services} serviceShares={serviceShares} tariffSettings={tariffSettings} reloadData={reloadData} showToast={showToast} />}
+          ) : <WorkspaceView active={active} role={role} patients={patients} staff={staff} leads={leads} setLeads={setLeads} medications={medications} referrals={referrals} appointmentRecords={appointmentRecords} transactions={transactions} visits={visits} services={services} serviceShares={serviceShares} tariffSettings={tariffSettings} users={users} currentEmail={user.email} currentColleagueName={user.colleagueName} reloadData={reloadData} showToast={showToast} />}
         </div>
 
         <nav className="mobile-nav" aria-label="منوی موبایل">

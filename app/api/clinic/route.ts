@@ -3,6 +3,7 @@ import { getDb } from "../../../db";
 import {
   appointments, auditLogs, clinicalVisits, collaboratorServiceShares, crmLeads, financialTransactions,
   medicalServices, medications, patients, referrals, staff, tariffSettings,
+  userAccounts,
 } from "../../../db/schema";
 import { PAIN_SERVICES_1405, TARIFF_SOURCE_1405 } from "../../data/pain-services-1405";
 import { canAccess, getAccessUser, type AccessUser } from "../../access";
@@ -15,6 +16,8 @@ const latinDigits = (value: unknown) => clean(value).replace(/[۰-۹]/g, (digit)
 const number = (value: unknown) => { const parsed = Number(latinDigits(value).replace(/[٬,\s]/g, "")); return Number.isFinite(parsed) ? Math.round(parsed) : 0; };
 const decimal = (value: unknown) => { const parsed = Number(latinDigits(value).replace(/[٬,\s]/g, "").replace("/", ".")); return Number.isFinite(parsed) ? parsed : 0; };
 const storageUnavailable = (error: unknown) => /binding|no such table|D1/i.test(error instanceof Error ? error.message : String(error));
+const accountRoles = new Set(["مدیر سیستم", "پذیرش", "پزشک", "حسابداری", "داروخانه", "همکار بیرونی", "بیمار"]);
+const accountStatuses = new Set(["active", "pending", "suspended"]);
 
 type TariffConfig = typeof tariffSettings.$inferSelect;
 type MedicalService = typeof medicalServices.$inferSelect;
@@ -76,18 +79,30 @@ export async function GET() {
     if (!user) return Response.json({ error: "ورود یا دسترسی معتبر نیست" }, { status: 401 });
     const db = getDb();
     const activeTariff = await ensureServiceCatalog();
-    const referralQuery = user.role === "همکار بیرونی" && user.colleagueName
-      ? db.select().from(referrals).where(eq(referrals.colleagueName, user.colleagueName)).orderBy(desc(referrals.createdAt)).limit(250)
-      : db.select().from(referrals).orderBy(desc(referrals.createdAt)).limit(250);
-    const [patientRows, staffRows, leadRows, medicationRows, referralRows, appointmentRows, transactionRows, visitRows] = await Promise.all([
-      canAccess(user, "patient") ? db.select().from(patients).orderBy(desc(patients.createdAt)).limit(500) : Promise.resolve([]),
+    const patientViewer = user.role === "بیمار" && Boolean(user.patientId);
+    const referralQuery = !canAccess(user, "referral")
+      ? Promise.resolve([])
+      : user.role === "همکار بیرونی" && user.colleagueName
+        ? db.select().from(referrals).where(eq(referrals.colleagueName, user.colleagueName)).orderBy(desc(referrals.createdAt)).limit(250)
+        : db.select().from(referrals).orderBy(desc(referrals.createdAt)).limit(250);
+    const [patientRows, staffRows, leadRows, medicationRows, referralRows, appointmentRows, transactionRows, visitRows, userRows] = await Promise.all([
+      patientViewer && user.patientId
+        ? db.select().from(patients).where(eq(patients.id, user.patientId)).limit(1)
+        : canAccess(user, "patient") ? db.select().from(patients).orderBy(desc(patients.createdAt)).limit(500) : Promise.resolve([]),
       canAccess(user, "staff") ? db.select().from(staff).orderBy(desc(staff.createdAt)).limit(300) : Promise.resolve([]),
       canAccess(user, "lead") ? db.select().from(crmLeads).orderBy(desc(crmLeads.createdAt)).limit(500) : Promise.resolve([]),
       canAccess(user, "medication") ? db.select().from(medications).orderBy(desc(medications.createdAt)).limit(500) : Promise.resolve([]),
       referralQuery,
-      canAccess(user, "appointment") ? db.select().from(appointments).orderBy(desc(appointments.date), desc(appointments.time)).limit(500) : Promise.resolve([]),
-      canAccess(user, "transaction") ? db.select().from(financialTransactions).orderBy(desc(financialTransactions.createdAt)).limit(500) : Promise.resolve([]),
-      canAccess(user, "visit") ? db.select().from(clinicalVisits).orderBy(desc(clinicalVisits.createdAt)).limit(500) : Promise.resolve([]),
+      patientViewer && user.patientId
+        ? db.select().from(appointments).where(eq(appointments.patientId, user.patientId)).orderBy(desc(appointments.date), desc(appointments.time)).limit(250)
+        : canAccess(user, "appointment") ? db.select().from(appointments).orderBy(desc(appointments.date), desc(appointments.time)).limit(500) : Promise.resolve([]),
+      patientViewer && user.patientId
+        ? db.select().from(financialTransactions).where(eq(financialTransactions.patientId, user.patientId)).orderBy(desc(financialTransactions.createdAt)).limit(250)
+        : canAccess(user, "transaction") ? db.select().from(financialTransactions).orderBy(desc(financialTransactions.createdAt)).limit(500) : Promise.resolve([]),
+      patientViewer && user.patientId
+        ? db.select().from(clinicalVisits).where(eq(clinicalVisits.patientId, user.patientId)).orderBy(desc(clinicalVisits.createdAt)).limit(250)
+        : canAccess(user, "visit") ? db.select().from(clinicalVisits).orderBy(desc(clinicalVisits.createdAt)).limit(500) : Promise.resolve([]),
+      user.role === "مدیر سیستم" ? db.select().from(userAccounts).orderBy(desc(userAccounts.createdAt)).limit(500) : Promise.resolve([]),
     ]);
     const serviceRows = canAccess(user, "service")
       ? (user.role === "مدیر سیستم"
@@ -101,9 +116,13 @@ export async function GET() {
       const [colleague] = await db.select().from(staff).where(eq(staff.name, user.colleagueName)).limit(1);
       if (colleague) shareRows = await db.select().from(collaboratorServiceShares).where(and(eq(collaboratorServiceShares.staffId, colleague.id), eq(collaboratorServiceShares.active, true))).limit(500);
     }
+    const visibleReferralRows = user.role === "همکار بیرونی"
+      ? referralRows.map((row) => ({ ...row, nationalId: `${row.nationalId.slice(0, 3)}•••••••` }))
+      : referralRows;
     return Response.json({
       patients: patientRows, staff: staffRows, leads: leadRows, medications: medicationRows,
-      referrals: referralRows, appointments: appointmentRows, transactions: transactionRows, visits: visitRows,
+      referrals: visibleReferralRows, appointments: appointmentRows, transactions: transactionRows, visits: visitRows,
+      users: userRows,
       services: serviceRows.map((service) => ({ ...service, tariffRials: calculateTariffRials(service, activeTariff) })),
       serviceShares: shareRows,
       tariffSettings: activeTariff,
@@ -123,6 +142,79 @@ export async function POST(request: Request) {
     const user = await authorized(permissionEntity);
     if (!user) return Response.json({ error: "برای این عملیات دسترسی ندارید" }, { status: 403 });
     const db = getDb();
+
+    if (payload.entity === "demoSeed") {
+      if (user.role !== "مدیر سیستم") return Response.json({ error: "داده نمونه فقط با تأیید مدیر قابل ایجاد است" }, { status: 403 });
+      const today = new Date();
+      const day = (offset: number) => new Date(today.getTime() + offset * 86_400_000).toISOString().slice(0, 10);
+      const at = (offset: number) => new Date(today.getTime() + offset * 86_400_000).toISOString();
+
+      await db.insert(staff).values([
+        { id: "DEMO-STF-DR", name: "دکتر نمونه نیلوفر راد", role: "پزشک", personnelType: "داخلی", specialty: "فلوشیپ درد", phone: "09000000010", shift: "روزهای زوج", status: "active", revenueShare: 35 },
+        { id: "DEMO-STF-REF", name: "مرکز نمونه تندرستی", role: "همکار ارجاع‌دهنده", personnelType: "بیرونی", specialty: "فیزیوتراپی", phone: "09000000011", shift: "ارجاع موردی", status: "active", revenueShare: 8 },
+      ]).onConflictDoNothing();
+      await db.insert(patients).values([
+        { id: "DEMO-PAT-001", nationalId: "0000000001", name: "بیمار نمونه سارا", phone: "09000000001", birthDate: "1988-04-12", gender: "زن", city: "کرج", service: "ویزیت فلوشیپ درد", doctor: "دکتر نمونه نیلوفر راد", status: "active", tags: JSON.stringify(["نمونه", "پیگیری فعال"]), balance: 850000, createdAt: at(-45) },
+        { id: "DEMO-PAT-002", nationalId: "0000000002", name: "بیمار نمونه آرمان", phone: "09000000002", birthDate: "1979-09-03", gender: "مرد", city: "فردیس", service: "تزریق مفصل", doctor: "دکتر نمونه نیلوفر راد", status: "treatment", tags: JSON.stringify(["نمونه", "تزریق"]), balance: 0, createdAt: at(-24) },
+        { id: "DEMO-PAT-003", nationalId: "0000000003", name: "بیمار نمونه مهتاب", phone: "09000000003", birthDate: "1993-01-19", gender: "زن", city: "تهران", service: "ارزیابی درد کمر", doctor: "دکتر نمونه نیلوفر راد", status: "waiting", tags: JSON.stringify(["نمونه", "ارجاعی"]), balance: 420000, createdAt: at(-7) },
+      ]).onConflictDoNothing();
+      await db.insert(appointments).values([
+        { id: "DEMO-APT-001", patientId: "DEMO-PAT-001", patientName: "بیمار نمونه سارا", nationalId: "0000000001", date: day(-30), time: "10:30", doctor: "دکتر نمونه نیلوفر راد", service: "ویزیت فلوشیپ درد", room: "اتاق ۲", status: "completed", notes: "ارزیابی اولیه درد گردن", createdAt: at(-31) },
+        { id: "DEMO-APT-002", patientId: "DEMO-PAT-001", patientName: "بیمار نمونه سارا", nationalId: "0000000001", date: day(3), time: "16:00", doctor: "دکتر نمونه نیلوفر راد", service: "پیگیری درمان", room: "اتاق ۱", status: "scheduled", notes: "بررسی پاسخ به درمان", createdAt: at(-2) },
+        { id: "DEMO-APT-003", patientId: "DEMO-PAT-002", patientName: "بیمار نمونه آرمان", nationalId: "0000000002", date: day(0), time: "12:15", doctor: "دکتر نمونه نیلوفر راد", service: "تزریق مفصل", room: "اتاق پروسیجر", status: "arrived", notes: "داده کاملاً ساختگی برای آزمون", createdAt: at(-3) },
+      ]).onConflictDoNothing();
+      await db.insert(clinicalVisits).values([
+        { id: "DEMO-VIS-001", patientId: "DEMO-PAT-001", appointmentId: "DEMO-APT-001", doctor: "دکتر نمونه نیلوفر راد", chiefComplaint: "درد گردن با انتشار به شانه", diagnosis: "درد میوفاشیال؛ داده نمونه", treatment: "فیزیوتراپی و اصلاح فعالیت", medications: "داروی نمونه طبق دستور پزشک", followUpAt: day(3), status: "open", createdAt: at(-30) },
+        { id: "DEMO-VIS-002", patientId: "DEMO-PAT-002", doctor: "دکتر نمونه نیلوفر راد", chiefComplaint: "درد زانو", diagnosis: "استئوآرتریت؛ داده نمونه", treatment: "برنامه‌ریزی تزریق مفصل", status: "open", createdAt: at(-12) },
+      ]).onConflictDoNothing();
+      await db.insert(financialTransactions).values([
+        { id: "DEMO-TXN-001", patientId: "DEMO-PAT-001", counterparty: "بیمار نمونه سارا", category: "service", description: "ویزیت و ارزیابی نمونه", amount: 595000, paymentMethod: "کارتخوان", status: "paid", referenceId: "DEMO-APT-001", createdAt: at(-30) },
+        { id: "DEMO-TXN-002", patientId: "DEMO-PAT-001", counterparty: "بیمار نمونه سارا", category: "service", description: "باقیمانده برنامه درمان نمونه", amount: 850000, paymentMethod: "انتقال بانکی", status: "pending", createdAt: at(-5) },
+      ]).onConflictDoNothing();
+      await db.insert(crmLeads).values([
+        { id: "DEMO-LEAD-001", name: "مخاطب نمونه پویا", phone: "09000000020", source: "وب‌سایت", service: "مشاوره درد کمر", owner: user.displayName, stage: "new", nextAction: "تماس آزمایشی امروز", value: 1200000, notes: "داده نمونه و غیرواقعی", createdAt: at(-1) },
+      ]).onConflictDoNothing();
+      await db.insert(medications).values([
+        { id: "DEMO-MED-001", name: "کیت مصرفی نمونه", genericName: "Demo kit", category: "مصرفی", stock: 4, minStock: 6, unit: "کیت", unitPrice: 180000, batch: "DEMO-01", expiresAt: "1406/12/29", supplier: "تأمین‌کننده نمونه", createdAt: at(-4) },
+      ]).onConflictDoNothing();
+      await db.insert(referrals).values([
+        { id: "DEMO-REF-001", nationalId: "0000000003", colleagueName: "مرکز نمونه تندرستی", service: "ارزیابی درد کمر", status: "registered", tariffAmount: 5950000, shareType: "percentage", shareValue: 8, shareAmount: 476000, createdAt: at(-7) },
+      ]).onConflictDoNothing();
+      await audit(user, "seed", "demoSeed", "DEMO-DATASET", { synthetic: true });
+      return Response.json({ seeded: true, message: "داده‌های ساختگی و قابل تعامل آماده شدند" }, { status: 201 });
+    }
+
+    if (payload.entity === "userAccount") {
+      if (user.role !== "مدیر سیستم") return Response.json({ error: "مدیریت کاربران فقط برای مدیر سامانه مجاز است" }, { status: 403 });
+      const email = clean(data.email).toLowerCase();
+      const displayName = clean(data.displayName);
+      const role = clean(data.role);
+      const status = accountStatuses.has(clean(data.status)) ? clean(data.status) : "active";
+      const colleagueName = role === "همکار بیرونی" ? clean(data.colleagueName) : null;
+      const patientId = role === "بیمار" ? clean(data.patientId) : null;
+      if (!/^\S+@\S+\.\S+$/.test(email) || !displayName || !accountRoles.has(role))
+        return Response.json({ error: "نام، ایمیل معتبر و نقش کاربری الزامی است" }, { status: 400 });
+      if (role === "همکار بیرونی" && !colleagueName)
+        return Response.json({ error: "برای همکار بیرونی، اتصال به پرونده همکار الزامی است" }, { status: 400 });
+      if (role === "بیمار" && !patientId)
+        return Response.json({ error: "برای نقش بیمار، اتصال حساب به پرونده بیمار الزامی است" }, { status: 400 });
+      if (colleagueName) {
+        const [linkedColleague] = await db.select({ id: staff.id }).from(staff).where(and(eq(staff.name, colleagueName), eq(staff.personnelType, "بیرونی"))).limit(1);
+        if (!linkedColleague) return Response.json({ error: "همکار بیرونی انتخاب‌شده پیدا نشد" }, { status: 404 });
+      }
+      if (patientId) {
+        const [linkedPatient] = await db.select({ id: patients.id }).from(patients).where(eq(patients.id, patientId)).limit(1);
+        if (!linkedPatient) return Response.json({ error: "پرونده بیمار انتخاب‌شده پیدا نشد" }, { status: 404 });
+      }
+      const [existingAccount] = await db.select().from(userAccounts).where(eq(userAccounts.email, email)).limit(1);
+      if (existingAccount?.email === user.email && (role !== "مدیر سیستم" || status !== "active"))
+        return Response.json({ error: "مدیر نمی‌تواند دسترسی حساب فعلی خود را حذف کند" }, { status: 400 });
+      const [row] = existingAccount
+        ? await db.update(userAccounts).set({ displayName, role, status, colleagueName, patientId }).where(eq(userAccounts.id, existingAccount.id)).returning()
+        : await db.insert(userAccounts).values({ id: id("USR"), email, displayName, role, status, colleagueName, patientId }).returning();
+      await audit(user, existingAccount ? "update" : "create", "userAccount", row.id, { email, role, status });
+      return Response.json({ record: row }, { status: existingAccount ? 200 : 201 });
+    }
 
     if (payload.entity === "service") {
       if (user.role !== "مدیر سیستم") return Response.json({ error: "تعریف خدمت جدید فقط برای مدیر سامانه مجاز است" }, { status: 403 });
@@ -317,6 +409,38 @@ export async function PATCH(request: Request) {
     const recordId = clean(payload.id), data = payload.data ?? {}, db = getDb();
     if (!recordId) return Response.json({ error: "شناسه رکورد الزامی است" }, { status: 400 });
     let row: Record<string, unknown> | undefined;
+    if (payload.entity === "userAccount") {
+      if (user.role !== "مدیر سیستم") return Response.json({ error: "مدیریت کاربران فقط برای مدیر سامانه مجاز است" }, { status: 403 });
+      const [current] = await db.select().from(userAccounts).where(eq(userAccounts.id, recordId)).limit(1);
+      if (current) {
+        const displayName = data.displayName == null ? current.displayName : clean(data.displayName);
+        const role = data.role == null ? current.role : clean(data.role);
+        const status = data.status == null ? current.status : clean(data.status);
+        const colleagueName = role === "همکار بیرونی"
+          ? (data.colleagueName == null ? current.colleagueName : clean(data.colleagueName) || null)
+          : null;
+        const patientId = role === "بیمار"
+          ? (data.patientId == null ? current.patientId : clean(data.patientId) || null)
+          : null;
+        if (!displayName || !accountRoles.has(role) || !accountStatuses.has(status))
+          return Response.json({ error: "نام، نقش یا وضعیت کاربر معتبر نیست" }, { status: 400 });
+        if (current.email === user.email && (role !== "مدیر سیستم" || status !== "active"))
+          return Response.json({ error: "مدیر نمی‌تواند دسترسی حساب فعلی خود را حذف کند" }, { status: 400 });
+        if (role === "همکار بیرونی" && !colleagueName)
+          return Response.json({ error: "برای همکار بیرونی، اتصال به پرونده همکار الزامی است" }, { status: 400 });
+        if (role === "بیمار" && !patientId)
+          return Response.json({ error: "برای نقش بیمار، اتصال حساب به پرونده بیمار الزامی است" }, { status: 400 });
+        if (colleagueName) {
+          const [linkedColleague] = await db.select({ id: staff.id }).from(staff).where(and(eq(staff.name, colleagueName), eq(staff.personnelType, "بیرونی"))).limit(1);
+          if (!linkedColleague) return Response.json({ error: "همکار بیرونی انتخاب‌شده پیدا نشد" }, { status: 404 });
+        }
+        if (patientId) {
+          const [linkedPatient] = await db.select({ id: patients.id }).from(patients).where(eq(patients.id, patientId)).limit(1);
+          if (!linkedPatient) return Response.json({ error: "پرونده بیمار انتخاب‌شده پیدا نشد" }, { status: 404 });
+        }
+        [row] = await db.update(userAccounts).set({ displayName, role, status, colleagueName, patientId }).where(eq(userAccounts.id, recordId)).returning();
+      }
+    }
     if (payload.entity === "service") {
       if (user.role !== "مدیر سیستم") return Response.json({ error: "ویرایش تعرفه فقط برای مدیر سامانه مجاز است" }, { status: 403 });
       const [current] = await db.select().from(medicalServices).where(eq(medicalServices.id, recordId)).limit(1);
@@ -369,7 +493,19 @@ export async function PATCH(request: Request) {
     }
     if (payload.entity === "patient") [row] = await db.update(patients).set({ status: clean(data.status) || "active" }).where(eq(patients.id, recordId)).returning();
     if (payload.entity === "appointment") [row] = await db.update(appointments).set({ status: clean(data.status) || "scheduled", room: clean(data.room) || null }).where(eq(appointments.id, recordId)).returning();
-    if (payload.entity === "referral") [row] = await db.update(referrals).set({ status: clean(data.status) || "registered", shareAmount: Math.max(0, number(data.shareAmount)) }).where(eq(referrals.id, recordId)).returning();
+    if (payload.entity === "referral") {
+      if (user.role === "همکار بیرونی") return Response.json({ error: "تغییر وضعیت و مبالغ ارجاع برای همکار بیرونی مجاز نیست" }, { status: 403 });
+      const [current] = await db.select().from(referrals).where(eq(referrals.id, recordId)).limit(1);
+      if (current) {
+        const update = {
+          status: clean(data.status) || current.status,
+          shareAmount: (user.role === "مدیر سیستم" || user.role === "حسابداری") && data.shareAmount != null
+            ? Math.max(0, number(data.shareAmount))
+            : current.shareAmount,
+        };
+        [row] = await db.update(referrals).set(update).where(eq(referrals.id, recordId)).returning();
+      }
+    }
     if (payload.entity === "transaction") [row] = await db.update(financialTransactions).set({ status: clean(data.status) || "paid" }).where(eq(financialTransactions.id, recordId)).returning();
     if (!row) return Response.json({ error: "رکورد یا نوع عملیات پیدا نشد" }, { status: 404 });
     await audit(user, "update", payload.entity ?? "unknown", recordId, data);
